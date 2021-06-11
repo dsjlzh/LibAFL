@@ -212,7 +212,7 @@ impl AsanRuntime {
         };
         assert!(unsafe { getrlimit(RLIMIT_STACK, &mut stack_rlimit as *mut rlimit) } == 0);
 
-        stack_rlimit.rlim_max as usize
+        stack_rlimit.rlim_cur as usize
     }
 
     /// Get the maximum stack size for the current stack

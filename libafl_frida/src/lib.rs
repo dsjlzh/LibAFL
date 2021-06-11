@@ -9,10 +9,15 @@ pub mod alloc;
 pub mod asan_errors;
 /// The frida address sanitizer runtime
 pub mod asan_rt;
-/// The `LibAFL` frida helper
+
+#[cfg(feature = "cmplog")]
+/// The frida cmplog runtime
+pub mod cmplog_rt;
+
+/// The `LibAFL` firda helper
 pub mod helper;
 
-// for parsing asan cores
+// for parsing asan and cmplog cores
 use libafl::bolts::os::parse_core_bind_arg;
 // for getting current core_id
 use core_affinity::get_core_ids;
@@ -28,6 +33,7 @@ pub struct FridaOptions {
     enable_coverage: bool,
     enable_drcov: bool,
     instrument_suppress_locations: Option<Vec<(String, usize)>>,
+    enable_cmplog: bool,
 }
 
 impl FridaOptions {
@@ -38,9 +44,11 @@ impl FridaOptions {
     /// # Panics
     /// Panics, if no `=` sign exists in input, or or `value` behind `=` has zero length.
     #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn parse_env_options() -> Self {
         let mut options = Self::default();
         let mut asan_cores = None;
+        let mut cmplog_cores = None;
 
         if let Ok(env_options) = std::env::var("LIBAFL_FRIDA_OPTIONS") {
             for option in env_options.trim().split(':') {
@@ -100,6 +108,22 @@ impl FridaOptions {
                             );
                         }
                     }
+                    "cmplog" => {
+                        options.enable_cmplog = value.parse().unwrap();
+                        #[cfg(not(target_arch = "aarch64"))]
+                        if options.enable_cmplog {
+                            panic!(
+                                "cmplog is not currently supported on targets other than aarch64"
+                            );
+                        }
+
+                        if !cfg!(feature = "cmplog") && options.enable_cmplog {
+                            panic!("cmplog feature is disabled!")
+                        }
+                    }
+                    "cmplog-cores" => {
+                        cmplog_cores = parse_core_bind_arg(value);
+                    }
                     _ => {
                         panic!("unknown FRIDA option: '{}'", option);
                     }
@@ -112,14 +136,25 @@ impl FridaOptions {
                     assert_eq!(
                         core_ids.len(),
                         1,
-                        "Client should only be enabled on one core"
+                        "Client should only be bound to a single core"
                     );
                     let core_id = core_ids[0].id;
                     options.enable_asan = asan_cores.contains(&core_id);
                 }
             }
+            if options.enable_cmplog {
+                if let Some(cmplog_cores) = cmplog_cores {
+                    let core_ids = get_core_ids().unwrap();
+                    assert_eq!(
+                        core_ids.len(),
+                        1,
+                        "Client should only be bound to a single core"
+                    );
+                    let core_id = core_ids[0].id;
+                    options.enable_cmplog = cmplog_cores.contains(&core_id);
+                }
+            }
         }
-
         options
     }
 
@@ -142,6 +177,13 @@ impl FridaOptions {
     #[inline]
     pub fn drcov_enabled(&self) -> bool {
         self.enable_drcov
+    }
+
+    /// Is `CmpLog` enabled?
+    #[must_use]
+    #[inline]
+    pub fn cmplog_enabled(&self) -> bool {
+        self.enable_cmplog
     }
 
     /// Should ASAN detect leaks
@@ -190,6 +232,7 @@ impl Default for FridaOptions {
             enable_coverage: true,
             enable_drcov: false,
             instrument_suppress_locations: None,
+            enable_cmplog: false,
         }
     }
 }
