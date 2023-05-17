@@ -1,4 +1,8 @@
+//! The random number generators of `LibAFL`
 use core::{debug_assert, fmt::Debug};
+
+#[cfg(feature = "rand_trait")]
+use rand_core::{self, impls::fill_bytes_via_next, RngCore};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64_with_seed;
 
@@ -10,10 +14,10 @@ const HASH_CONST: u64 = 0xa5b35705;
 /// The standard rand implementation for `LibAFL`.
 /// It is usually the right choice, with very good speed and a reasonable randomness.
 /// Not cryptographically secure (which is not what you want during fuzzing ;) )
-pub type StdRand = RomuTrioRand;
+pub type StdRand = RomuDuoJrRand;
 
-/// Ways to get random around here
-/// Please note that these are not cryptographically secure
+/// Ways to get random around here.
+/// Please note that these are not cryptographically secure.
 /// Or, even if some might be by accident, at least they are not seeded in a cryptographically secure fashion.
 pub trait Rand: Debug + Serialize + DeserializeOwned {
     /// Sets the seed of this Rand
@@ -22,7 +26,7 @@ pub trait Rand: Debug + Serialize + DeserializeOwned {
     /// Gets the next 64 bit value
     fn next(&mut self) -> u64;
 
-    /// Gets a value below the given 64 bit val (inclusive)
+    /// Gets a value below the given 64 bit val (exclusive)
     fn below(&mut self, upper_bound_excl: u64) -> u64 {
         if upper_bound_excl <= 1 {
             return 0;
@@ -80,7 +84,7 @@ macro_rules! default_rand {
         /// A default RNG will usually produce a nondeterministic stream of random numbers.
         /// As we do not have any way to get random seeds for `no_std`, they have to be reproducible there.
         /// Use [`$rand::with_seed`] to generate a reproducible RNG.
-        impl core::default::Default for $rand {
+        impl Default for $rand {
             #[cfg(feature = "std")]
             fn default() -> Self {
                 Self::new()
@@ -110,7 +114,7 @@ pub trait RandomSeed: Rand + Default {
 }
 
 // helper macro to impl RandomSeed
-macro_rules! impl_randomseed {
+macro_rules! impl_random {
     ($rand: ty) => {
         #[cfg(feature = "std")]
         impl RandomSeed for $rand {
@@ -119,14 +123,33 @@ macro_rules! impl_randomseed {
                 Self::with_seed(current_nanos())
             }
         }
+
+        #[cfg(feature = "rand_trait")]
+        impl RngCore for $rand {
+            fn next_u32(&mut self) -> u32 {
+                self.next() as u32
+            }
+
+            fn next_u64(&mut self) -> u64 {
+                self.next()
+            }
+
+            fn fill_bytes(&mut self, dest: &mut [u8]) {
+                fill_bytes_via_next(self, dest)
+            }
+
+            fn try_fill_bytes(&mut self, dest: &mut [u8]) -> Result<(), rand_core::Error> {
+                Ok(self.fill_bytes(dest))
+            }
+        }
     };
 }
 
-impl_randomseed!(Xoshiro256StarRand);
-impl_randomseed!(XorShift64Rand);
-impl_randomseed!(Lehmer64Rand);
-impl_randomseed!(RomuTrioRand);
-impl_randomseed!(RomuDuoJrRand);
+impl_random!(Xoshiro256StarRand);
+impl_random!(XorShift64Rand);
+impl_random!(Lehmer64Rand);
+impl_random!(RomuTrioRand);
+impl_random!(RomuDuoJrRand);
 
 /// XXH3 Based, hopefully speedy, rnd implementation
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
@@ -273,7 +296,7 @@ impl Rand for RomuTrioRand {
         let xp = self.x_state;
         let yp = self.y_state;
         let zp = self.z_state;
-        self.x_state = 15241094284759029579u64.wrapping_mul(zp);
+        self.x_state = 15241094284759029579_u64.wrapping_mul(zp);
         self.y_state = yp.wrapping_sub(xp).rotate_left(12);
         self.z_state = zp.wrapping_sub(yp).rotate_left(44);
         xp
@@ -310,7 +333,7 @@ impl Rand for RomuDuoJrRand {
     #[allow(clippy::unreadable_literal)]
     fn next(&mut self) -> u64 {
         let xp = self.x_state;
-        self.x_state = 15241094284759029579u64.wrapping_mul(self.y_state);
+        self.x_state = 15241094284759029579_u64.wrapping_mul(self.y_state);
         self.y_state = self.y_state.wrapping_sub(xp).rotate_left(27);
         xp
     }
@@ -389,5 +412,110 @@ mod tests {
         // The seed should be reasonably random so these never fail
         assert_ne!(rand.next(), rand_fixed.next());
         test_single_rand(&mut rand);
+    }
+
+    #[test]
+    #[cfg(feature = "rand_trait")]
+    fn test_rgn_core_support() {
+        use rand_core::RngCore;
+
+        use crate::bolts::rands::StdRand;
+        pub struct Mutator<R: RngCore> {
+            rng: R,
+        }
+
+        let mut mutator = Mutator {
+            rng: StdRand::with_seed(0),
+        };
+
+        log::info!("random value: {}", mutator.rng.next_u32());
+    }
+}
+
+#[cfg(feature = "python")]
+#[allow(missing_docs)]
+/// `Rand` Python bindings
+pub mod pybind {
+    use pyo3::prelude::*;
+    use serde::{Deserialize, Serialize};
+
+    use super::Rand;
+    use crate::bolts::{current_nanos, rands::StdRand};
+
+    #[pyclass(unsendable, name = "StdRand")]
+    #[allow(clippy::unsafe_derive_deserialize)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    /// Python class for StdRand
+    pub struct PythonStdRand {
+        /// Rust wrapped StdRand object
+        pub inner: StdRand,
+    }
+
+    #[pymethods]
+    impl PythonStdRand {
+        #[staticmethod]
+        fn with_current_nanos() -> Self {
+            Self {
+                inner: StdRand::with_seed(current_nanos()),
+            }
+        }
+
+        #[staticmethod]
+        fn with_seed(seed: u64) -> Self {
+            Self {
+                inner: StdRand::with_seed(seed),
+            }
+        }
+
+        fn as_rand(slf: Py<Self>) -> PythonRand {
+            PythonRand::new_std(slf)
+        }
+    }
+
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    enum PythonRandWrapper {
+        Std(Py<PythonStdRand>),
+    }
+
+    /// Rand Trait binding
+    #[pyclass(unsendable, name = "Rand")]
+    #[allow(clippy::unsafe_derive_deserialize)]
+    #[derive(Serialize, Deserialize, Debug, Clone)]
+    pub struct PythonRand {
+        wrapper: PythonRandWrapper,
+    }
+
+    macro_rules! unwrap_me_mut {
+        ($wrapper:expr, $name:ident, $body:block) => {
+            crate::unwrap_me_mut_body!($wrapper, $name, $body, PythonRandWrapper, { Std })
+        };
+    }
+
+    #[pymethods]
+    impl PythonRand {
+        #[staticmethod]
+        fn new_std(py_std_rand: Py<PythonStdRand>) -> Self {
+            Self {
+                wrapper: PythonRandWrapper::Std(py_std_rand),
+            }
+        }
+    }
+
+    impl Rand for PythonRand {
+        fn set_seed(&mut self, seed: u64) {
+            unwrap_me_mut!(self.wrapper, r, { r.set_seed(seed) });
+        }
+
+        #[inline]
+        fn next(&mut self) -> u64 {
+            unwrap_me_mut!(self.wrapper, r, { r.next() })
+        }
+    }
+
+    /// Register the classes to the python module
+    pub fn register(_py: Python, m: &PyModule) -> PyResult<()> {
+        m.add_class::<PythonStdRand>()?;
+        m.add_class::<PythonRand>()?;
+        Ok(())
     }
 }

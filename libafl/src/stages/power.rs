@@ -1,48 +1,44 @@
-use core::marker::PhantomData;
+//! The power schedules. This stage should be invoked after the calibration stage.
+
+use core::{fmt::Debug, marker::PhantomData};
 
 use crate::{
-    bolts::rands::Rand,
-    corpus::{Corpus, CorpusScheduler},
-    events::EventManager,
+    corpus::{Corpus, CorpusId},
     executors::{Executor, HasObservers},
-    inputs::Input,
+    fuzzer::Evaluator,
     mutators::Mutator,
-    observers::ObserversTuple,
-    stages::{Stage, MutationalStage},
-    state::{Evaluator, HasCorpus, HasRand},
+    schedulers::{
+        ecofuzz::EcoTestcaseScore, testcase_score::CorpusPowerTestcaseScore, TestcaseScore,
+    },
+    stages::{mutational::MutatedTransform, MutationalStage, Stage},
+    state::{HasClientPerfMonitor, HasCorpus, HasMetadata, HasRand, UsesState},
     Error,
 };
 
 /// The mutational stage using power schedules
 #[derive(Clone, Debug)]
-pub struct PowerMutationalStage<C, CS, E, EM, I, M, OT, R, S>
-where
-    M: Mutator<I, S>,
-    I: Input,
-    S: HasCorpus<C, I> + Evaluator<I> + HasRand<R>,
-    C: Corpus<I>,
-    EM: EventManager<I, S>,
-    E: Executor<I> + HasObservers<OT>,
-    OT: ObserversTuple,
-    CS: CorpusScheduler<I, S>,
-    R: Rand,
-{
+pub struct PowerMutationalStage<E, F, EM, I, M, Z> {
     mutator: M,
-    phantom: PhantomData<(C, CS, E, EM, I, OT, R, S)>,
+    #[allow(clippy::type_complexity)]
+    phantom: PhantomData<(E, F, EM, I, Z)>,
 }
 
-impl<C, CS, E, EM, I, M, OT, R, S> MutationalStage<C, CS, E, EM, I, M, OT, S>
-    for PowerMutationalStage<C, CS, E, EM, I, M, OT, R, S>
+impl<E, F, EM, I, M, Z> UsesState for PowerMutationalStage<E, F, EM, I, M, Z>
 where
-    M: Mutator<I, S>,
-    I: Input,
-    S: HasCorpus<C, I> + Evaluator<I> + HasRand<R>,
-    C: Corpus<I>,
-    EM: EventManager<I, S>,
-    E: Executor<I> + HasObservers<OT>,
-    OT: ObserversTuple,
-    CS: CorpusScheduler<I, S>,
-    R: Rand,
+    E: UsesState,
+{
+    type State = E::State;
+}
+
+impl<E, F, EM, I, M, Z> MutationalStage<E, EM, I, M, Z> for PowerMutationalStage<E, F, EM, I, M, Z>
+where
+    E: Executor<EM, Z> + HasObservers,
+    EM: UsesState<State = E::State>,
+    F: TestcaseScore<E::State>,
+    M: Mutator<I, E::State>,
+    E::State: HasClientPerfMonitor + HasCorpus + HasMetadata + HasRand,
+    Z: Evaluator<E, EM, State = E::State>,
+    I: MutatedTransform<E::Input, E::State> + Clone,
 {
     /// The mutator, added to this stage
     #[inline]
@@ -57,54 +53,78 @@ where
     }
 
     /// Gets the number of iterations as a random number
-    fn iterations(&self, state: &mut S) -> usize {
-        1 + state.rand_mut().below(DEFAULT_MUTATIONAL_MAX_ITERATIONS) as usize
+    #[allow(clippy::cast_sign_loss)]
+    fn iterations(&self, state: &mut E::State, corpus_idx: CorpusId) -> Result<u64, Error> {
+        // Update handicap
+        let mut testcase = state.corpus().get(corpus_idx)?.borrow_mut();
+        let score = F::compute(state, &mut *testcase)? as u64;
+
+        Ok(score)
     }
 }
 
-impl<C, CS, E, EM, I, M, OT, R, S> Stage<CS, E, EM, I, S>
-    for PowerMutationalStage<C, CS, E, EM, I, M, OT, R, S>
+impl<E, F, EM, I, M, Z> Stage<E, EM, Z> for PowerMutationalStage<E, F, EM, I, M, Z>
 where
-    M: Mutator<I, S>,
-    I: Input,
-    S: HasCorpus<C, I> + Evaluator<I> + HasRand<R>,
-    C: Corpus<I>,
-    EM: EventManager<I, S>,
-    E: Executor<I> + HasObservers<OT>,
-    OT: ObserversTuple,
-    CS: CorpusScheduler<I, S>,
-    R: Rand,
+    E: Executor<EM, Z> + HasObservers,
+    EM: UsesState<State = E::State>,
+    F: TestcaseScore<E::State>,
+    M: Mutator<I, E::State>,
+    E::State: HasClientPerfMonitor + HasCorpus + HasMetadata + HasRand,
+    Z: Evaluator<E, EM, State = E::State>,
+    I: MutatedTransform<E::Input, E::State> + Clone,
 {
     #[inline]
+    #[allow(clippy::let_and_return)]
     fn perform(
-        &self,
-        state: &mut S,
+        &mut self,
+        fuzzer: &mut Z,
         executor: &mut E,
+        state: &mut E::State,
         manager: &mut EM,
-        scheduler: &CS,
-        corpus_idx: usize,
+        corpus_idx: CorpusId,
     ) -> Result<(), Error> {
-        self.perform_mutational(state, executor, manager, scheduler, corpus_idx)
+        let ret = self.perform_mutational(fuzzer, executor, state, manager, corpus_idx);
+        ret
     }
 }
 
-impl<C, CS, E, EM, I, M, OT, R, S> PowerMutationalStage<C, CS, E, EM, I, M, OT, R, S>
+impl<E, F, EM, M, Z> PowerMutationalStage<E, F, EM, E::Input, M, Z>
 where
-    M: Mutator<I, S>,
-    I: Input,
-    S: HasCorpus<C, I> + Evaluator<I> + HasRand<R>,
-    C: Corpus<I>,
-    EM: EventManager<I, S>,
-    E: Executor<I> + HasObservers<OT>,
-    OT: ObserversTuple,
-    CS: CorpusScheduler<I, S>,
-    R: Rand,
+    E: Executor<EM, Z> + HasObservers,
+    EM: UsesState<State = E::State>,
+    F: TestcaseScore<E::State>,
+    M: Mutator<E::Input, E::State>,
+    E::State: HasClientPerfMonitor + HasCorpus + HasMetadata + HasRand,
+    Z: Evaluator<E, EM, State = E::State>,
 {
-    /// Creates a new default mutational stage
+    /// Creates a new [`PowerMutationalStage`]
     pub fn new(mutator: M) -> Self {
+        Self::transforming(mutator)
+    }
+}
+
+impl<E, F, EM, I, M, Z> PowerMutationalStage<E, F, EM, I, M, Z>
+where
+    E: Executor<EM, Z> + HasObservers,
+    EM: UsesState<State = E::State>,
+    F: TestcaseScore<E::State>,
+    M: Mutator<I, E::State>,
+    E::State: HasClientPerfMonitor + HasCorpus + HasMetadata + HasRand,
+    Z: Evaluator<E, EM, State = E::State>,
+{
+    /// Creates a new transforming [`PowerMutationalStage`]
+    pub fn transforming(mutator: M) -> Self {
         Self {
-            mutator: mutator,
+            mutator,
             phantom: PhantomData,
         }
     }
 }
+
+/// The standard powerscheduling stage
+pub type StdPowerMutationalStage<E, EM, I, M, Z> =
+    PowerMutationalStage<E, CorpusPowerTestcaseScore<<E as UsesState>::State>, EM, I, M, Z>;
+
+/// Ecofuzz scheduling stage
+pub type EcoPowerMutationalStage<E, EM, I, M, Z> =
+    PowerMutationalStage<E, EcoTestcaseScore<<E as UsesState>::State>, EM, I, M, Z>;

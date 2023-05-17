@@ -22,7 +22,7 @@ cargo build --release
 This will build the library with the fuzzer (src/lib.rs) with the libfuzzer compatibility layer and the SanitizerCoverage runtime functions for coverage feedback.
 In addition, it will also build two C and C++ compiler wrappers (bin/libafl_c(libafl_c/xx).rs) that you must use to compile the target.
 
-The compiler wrappers, `libafl_cc` and libafl_cxx`, will end up in `./target/release/` (or `./target/debug`, in case you did not build with the `--release` flag).
+The compiler wrappers, `libafl_cc` and `libafl_cxx`, will end up in `./target/release/` (or `./target/debug`, in case you did not build with the `--release` flag).
 
 Then download libpng, and unpack the archive:
 ```bash
@@ -34,8 +34,8 @@ Now compile libpng, using the libafl_cc compiler wrapper:
 
 ```bash
 cd libpng-1.6.37
-./configure
-make CC=$(realpath ../target/release/libafl_cc) CXX=$(realpath ../target/release/libafl_cxx) -j `nproc`
+./configure --enable-shared=no --with-pic=yes --enable-hardware-optimizations=yes
+make CC="$(pwd)/../target/release/libafl_cc" CXX="$(pwd)/../target/release/libafl_cxx" -j `nproc`
 ```
 
 You can find the static lib at `libpng-1.6.37/.libs/libpng16.a`.
